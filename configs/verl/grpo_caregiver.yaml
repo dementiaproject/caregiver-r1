@@ -1,0 +1,130 @@
+# =============================================================================
+# verl-GDPO Hydra config for caregiver-R1 EC-MTRL training.
+#
+# Layout follows verl-GDPO's `verl/trainer/config/ppo_trainer.yaml`. Place
+# this at `verl_configs/grpo_caregiver.yaml` inside your verl-GDPO fork
+# (or pass `--config-path=$(pwd)/configs/verl --config-name=grpo_caregiver`).
+#
+# Pre-flight checklist
+# --------------------
+# 1. Three vllm-serve processes are running:
+#     - port 8000: caregiver model        (the one being trained — wire weight sync)
+#     - port 8001: judge (Qwen3-32B-Instruct, or Qwen3-8B for smoke)
+#     - DemMA: handled in-process by the rollout worker (loads HF checkpoint locally)
+#
+# 2. Scenarios JSONL is at data/scenarios_train.jsonl
+#     (run scripts/generate_scenarios.py --n 1500 --out data/scenarios_train.jsonl)
+#
+# 3. The verl-GDPO fork has the `ec_mtrl_dual_horizon` branch in
+#    `verl/trainer/ppo/ray_trainer.py` (apply docs/verl_patch.diff).
+#
+# 4. The custom rollout worker is registered:
+#       verl/workers/rollout/__init__.py:
+#           from caregiver_r1.training.verl_rollout_worker import CaregiverMultiTurnRollout
+#           ROLLOUT_REGISTRY['caregiver_multi_turn'] = CaregiverMultiTurnRollout
+#
+# 5. The reward manager is registered similarly.
+# =============================================================================
+
+algorithm:
+  adv_estimator: ec_mtrl_dual_horizon
+  alpha: 1.0
+  lambda_safety: 16.0   # 3 + 2·α_max + margin so violator strictly below worst clean
+  min_valid_turn: 5
+  whiten_advantages: true
+  kl_ctrl:
+    type: fixed
+    kl_coef: 0.01
+  gamma: 1.0
+  lam: 1.0
+
+data:
+  train_files: data/scenarios_train.jsonl
+  val_files: data/scenarios_smoke.jsonl
+  prompt_key: scenario_id           # row identifier; rollout worker reads scenario by id
+  max_prompt_length: 1024
+  max_response_length: 4096          # caregiver concatenated <think>+<response> across all turns
+  train_batch_size: 8                # SCENARIOS per step
+  return_raw_input_ids: false
+
+actor_rollout_ref:
+  hybrid_engine: true                # verl FSDP+vLLM hybrid; weight sync managed by verl
+
+  model:
+    path: ./checkpoints/sft_day1/final   # SFT'd caregiver checkpoint
+    use_remove_padding: true
+    enable_gradient_checkpointing: true
+
+  actor:
+    strategy: fsdp                    # fsdp | megatron
+    ppo_mini_batch_size: 8
+    ppo_micro_batch_size_per_gpu: 1
+    grad_clip: 1.0
+    clip_ratio: 0.2
+    entropy_coeff: 0.0
+    use_kl_loss: true
+    kl_loss_coef: 0.01
+    optim:
+      lr: 1.0e-6
+      weight_decay: 0.01
+      total_training_steps: 200
+
+  ref:
+    fsdp_config:
+      param_offload: true
+      grad_offload: false
+      optimizer_offload: false
+
+  rollout:
+    name: caregiver_multi_turn        # registered name in ROLLOUT_REGISTRY
+    n: 4                               # group size (trajectories per scenario)
+    max_turns: 6
+    prompt_length: 1024
+    response_length: 4096
+
+    # ---- HTTP backends consumed by the rollout worker ---------------------
+    caregiver_http:
+      base_url: http://localhost:8000
+      model_name: caregiver-sft        # name registered with `vllm serve --served-model-name`
+      temperature: 1.0
+      top_p: 0.9
+      max_tokens: 1024
+      request_timeout_s: 60.0
+      health_check_at_start: true
+
+    demma_mode: vllm                   # in-process vllm.LLM; the rollout worker loads it
+    demma_vllm:
+      model_path: ./checkpoints/demma_planner_sft
+      long_memory_path: ./checkpoints/demma_planner_sft/memories_27_long.json
+      short_memory_path: ./checkpoints/demma_planner_sft/weekly_schedule.jsonl
+      patient_id: 0
+      dtype: bfloat16
+      gpu_memory_utilization: 0.30     # leave room for caregiver actor + judge
+      max_model_len: 2048
+      max_new_tokens: 400
+      temperature: 0.5
+      top_p: 0.9
+
+    judge_vllm:
+      base_url: http://localhost:8001
+      model_name: Qwen/Qwen3-32B-Instruct
+      request_timeout_s: 120.0
+      max_tokens: 2048
+      health_check_at_start: true
+
+    per_rollout_seed_offset: 1000
+
+reward_model:
+  reward_manager: caregiver           # registered name; resolves to CaregiverRewardManager
+
+trainer:
+  total_epochs: 1
+  total_training_steps: 200            # smoke; 1000+ for real run
+  project_name: caregiver-r1
+  experiment_name: grpo-day1
+  logger: ['wandb']
+  nnodes: 1
+  n_gpus_per_node: 8                   # smoke 8xH100; scale up for real
+  save_freq: 10
+  test_freq: 50
+  default_local_dir: ./runs/grpo_day1

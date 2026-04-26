@@ -1,0 +1,92 @@
+# =============================================================================
+# Rubric: u_terminal — judge-aggregated patient state in the LAST 3 TURNS
+# =============================================================================
+# Two ordinal dimensions × {0, 1, 2}. Patient state is naturally ordinal,
+# so (unlike R_goal / R_fit) we keep ordinal scoring; boolean would lose
+# granularity that the judge can reliably discriminate.
+#
+# Direction: HIGHER = BETTER on every dimension and on the aggregate.
+# This is required for the advantage formula
+#     A_traj = CRank(R_goal) + CRank(R_fit) + CRank(u_terminal)
+# (paper §4.6.1) — if u_terminal were "higher = worse", group ranking
+# would put bad trajectories on top.
+#
+# Note: turn-level r_distress / r_resistance (paper §4.3) use the OPPOSITE
+# convention by construction (D_t ∈ {0, 1, 2, 3} with 3 = worst, then
+# `r_distress = D_{t-1} − D_t` so positive r_distress = improvement).
+# u_terminal is judge-derived and graded directly on the "good outcome"
+# scale, so it does not need sign flipping at consumption time.
+# =============================================================================
+
+name: u_terminal
+version: 1
+scoring_mode: ordinal_per_dimension
+
+description: >
+  Evaluate the LAST 3 TURNS of the conversation only — the closing window
+  where you can judge whether the dialogue is landing safely. Score each
+  of two dimensions on a 0–2 ordinal scale where higher = better, then
+  sum to obtain u_terminal ∈ [0, 4].
+
+dimensions:
+  - id: distress_end
+    text: |
+      Patient's distress level across the last 3 turns, integrating
+      inline annotation cues (motion / facial / sound) and patient
+      utterance content. Score the BEST realistic interpretation of
+      the closing window — not just the worst single moment.
+    levels:
+      - score: 0
+        anchor: |
+          Clear or severe distress at end. Either (a) two or more
+          moderate negative cues in the closing window, OR (b) a single
+          severe cue (crying, groaning, pushing away, throwing), OR (c)
+          explicit verbal distress in the patient utterance ("leave me
+          alone", "I can't stand this", repeated "no"). The dialogue is
+          NOT ending in a settled state.
+      - score: 1
+        anchor: |
+          Mild distress at end. One mild cue in the closing window (a
+          single sigh, a single frown, brief withdrawal) but the
+          patient appears recoverable — not escalating, not refusing,
+          not crying. Patient utterance may show worry but not panic.
+      - score: 2
+        anchor: |
+          Calm at end. No visible distress cues in the last 3 turns.
+          Patient appears settled — neutral or positive affect, no
+          frowning / sighing / withdrawing, no agitation in motion.
+          Patient utterance is engaged or accepting in tone.
+
+  - id: resistance_end
+    text: |
+      Patient's resistance to the implied or explicit care request
+      across the last 3 turns, on the RTC-anchored 3-tier scale.
+    levels:
+      - score: 0
+        anchor: |
+          Refused. Patient declined the care step explicitly ("no, I
+          won't", "I refuse"), OR walked away, OR pushed the caregiver
+          away, OR remained in a verbal or physical refusal posture.
+          The care attempt failed in the closing window.
+      - score: 1
+        anchor: |
+          Hesitant. Patient stalled or hedged on the care attempt
+          (verbal hesitation, stepping back, freezing mid-step,
+          extended silence, "maybe later") but did NOT flatly refuse.
+          Unresolved but not escalated.
+      - score: 2
+        anchor: |
+          Accepting. Patient agreed to or moved toward the care step
+          (took the pill, sat down, walked with the caregiver, nodded),
+          OR there was no care attempt in the closing window (no
+          resistance possible).
+
+aggregation:
+  type: sum
+  range: [0, 4]
+  formula: |
+    u_terminal = distress_end_score + resistance_end_score
+  semantics: |
+    HIGHER u_terminal = BETTER closing state.
+    Consumed directly by `compute_dual_horizon_advantage` (no sign flip
+    needed). Stored in `TrajectoryScores.u_terminal: int`.

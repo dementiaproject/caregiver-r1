@@ -1,0 +1,43 @@
+# =============================================================================
+# Caregiver SFT warm-up config (scripts/train_sft.py).
+#
+# Pre-RL fine-tune so the policy emits structurally valid <think>+<response>
+# from turn 0; cold-starting GRPO on a base model with no SFT yields very
+# noisy gradients (most rollouts have parse failures and zero reward).
+#
+# Pipeline:
+#   1. python -m src.training.sft_extract --dialog-corpus DemMA-corpus.jsonl ...
+#   2. python scripts/train_sft.py --config configs/sft.yaml
+#   3. python scripts/train_grpo.py --config configs/grpo_smoke.yaml
+#       (set caregiver.model_name_or_path to the SFT final/ checkpoint)
+# =============================================================================
+
+run:
+  name: caregiver-sft-day1
+  output_dir: ./runs/sft_day1
+  seed: 0
+
+model:
+  name_or_path: Qwen/Qwen3-8B
+  precision: bf16
+  use_flash_attention: true
+  gradient_checkpointing: true
+
+data:
+  train_jsonl: data/sft_caregiver.jsonl   # produced by sft_extract
+  eval_jsonl: null                          # set to a held-out shard if available
+  max_seq_len: 4096
+
+train:
+  num_epochs: 3
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 16          # effective batch 16
+  learning_rate: 5.0e-6
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  max_grad_norm: 1.0
+  logging_steps: 10
+  save_steps: 200
+  save_total_limit: 3
+  eval_steps: 200
+  report_to: ["wandb"]

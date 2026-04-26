@@ -1,0 +1,244 @@
+# =============================================================================
+# Caregiver-R1 — Smoke Run Config (Day 1: validate pipeline, mock judge)
+# =============================================================================
+# Purpose:
+#   Verify that the verl GRPO loop + EC-MTRL advantage estimator + DemMA mock
+#   client + mock judge wire together end-to-end without OOM / NaN, before
+#   spending real GPU on Phase F training.
+#
+# Anchored against:
+#   - zh_9 §4.2 / §4.6 / §4.7 (method)
+#   - ENGINEERING_PLAN §0 PoC tier + §E.3 smoke run definition
+#
+# What this smoke run skips (deliberately):
+#   - Real LLM judge (judge.mode = mock)
+#   - Real DemMA simulator (demma.mode = mock)
+#   - SFT warm-up Phase 0 (caregiver.kl_anchor_to = base)
+#   - Hacking audit (Phase F.4)
+#   - Human evaluation (Phase G.2)
+#
+# What this smoke run does NOT skip:
+#   - Unified caregiver prompt + temperature sampling (Decision 1, see
+#     PROPOSAL §9 — same prompt across all 10 rollouts; group diversity from
+#     temperature, not prompt)
+#   - Multi-horizon GDPO normalization (zh_9 §4.6.1)
+#   - α-weighted dual-horizon advantage (zh_9 §4.6.2)
+#   - Two-layer safety (C_cat 4-predicate stub + c_safety mock)
+#
+# DECISION LOG (2026-04-25, see PROPOSAL §9):
+#   - Decision 1: standard GRPO with a single unified prompt (reverted from
+#     zh_9 §1.5 ext ③ "strategy-conditioned group"). EC-MTRL contributions
+#     collapse to ① Multi-horizon GDPO + ② α-weighted dual-horizon advantage
+#     + DemMA testbed + PBRS theoretical contribution.
+#   - Decision 2: single-layer safety LLM judge (collapses zh_9 §4.5 two-layer
+#     C_cat regex + c_safety Lagrangian into one). c_safety ∈ {0,1,2,3};
+#     top tier triggers hard veto, tiers {1,2} feed Lagrangian.
+# =============================================================================
+
+run:
+  name: smoke-day1-mock-qwen3-8b
+  output_dir: ./runs/smoke_day1
+  seed: 0
+  wandb_project: caregiver-r1-smoke
+  wandb_mode: online           # set to "disabled" for purely offline smoke
+  log_every_step: 5
+
+# ---------------------------------------------------------------------------
+# Trainer (verl GRPO, critic-free)
+# ---------------------------------------------------------------------------
+trainer:
+  framework: verl              # ENGINEERING_PLAN §A.2 — verl recommended
+  algorithm: grpo
+  disable_value_head: true     # MUST — critic-free GRPO (zh_9 §4.7)
+  disable_gae: true            # MUST — group-relative, not GAE
+  total_epochs: 1
+  scenarios_per_epoch: 100     # smoke scale (default tier = 1500)
+  effective_batch_size: 32     # 32 scenarios = 160 trajectories per step
+  gradient_accumulation_steps: 4
+  learning_rate: 1.0e-6
+  beta_kl_init: 0.01           # KL anchor strength; tuned to keep KL ∈ [0.005, 0.1]
+  beta_kl_target_range: [0.005, 0.1]
+  ppo_clip_eps: 0.2
+  max_grad_norm: 1.0
+
+# ---------------------------------------------------------------------------
+# Caregiver agent (Qwen3-8B base, no SFT)
+# ---------------------------------------------------------------------------
+caregiver:
+  # ---- Rollout-time client backend (used by run_smoke.py rollout loop) ----
+  # mode: placeholder | mock | http
+  #   placeholder : canned strings (CPU-only debug; no model)
+  #   mock        : CaregiverMockClient (5 hand-written R1 outputs cycled)
+  #   http        : CaregiverHttpClient → vllm serve OpenAI endpoint
+  mode: placeholder
+  http:
+    base_url: http://localhost:8000   # vllm serve endpoint (no /v1)
+    model_name: Qwen/Qwen3-8B
+    temperature: 1.0
+    top_p: 0.9
+    max_tokens: 1024
+    request_timeout_s: 60.0
+    health_check_at_start: true
+    api_key: null
+
+  # ---- Verl training-time fields (used by Phase E.1 trainer, not by smoke) ----
+  model_name_or_path: Qwen/Qwen3-8B-Instruct
+  use_thinking_mode: true      # Qwen3 native <think>...</think> output
+  max_seq_len: 8192            # leaves headroom for <think> ~ 1-3K tokens
+  # Unified system prompt — held fixed across all 10 group rollouts.
+  # The loader extracts content between <<<BEGIN_PROMPT>>> and <<<END_PROMPT>>>.
+  system_prompt_path: prompts/caregiver_system_prompt.md
+  generation:
+    temperature: 0.9           # ≥ 0.8 required for principled group diversity
+    top_p: 0.95                # over the unified prompt (Decision 1, see PROPOSAL §9)
+    max_new_tokens: 1024       # per-turn cap; <think>+<response> together
+  kl_anchor_to: base           # zh_9 default would be SFT checkpoint π₀;
+                               # smoke run skips SFT and anchors to base.
+  # Fine-tuning backend
+  precision: bf16
+  use_flash_attention: true
+  vllm_inference:
+    tensor_parallel_size: 1    # smoke = single GPU; default tier scales to 4-8
+    gpu_memory_utilization: 0.85
+
+# ---------------------------------------------------------------------------
+# DemMA simulator
+# ---------------------------------------------------------------------------
+# Three back-ends are wired up:
+#   mode: mock    → src.data.DemMAMockClient (CPU; default for offline smoke)
+#   mode: real    → src.data.demma_real_client.DemMARealClient
+#                   (transformers in-process load of hulehule/DemMA-Planner-SFT;
+#                    needs ~16 GB VRAM on a single GPU)
+#   mode: vllm    → src.data.demma_vllm_client.DemMAVLLMClient
+#                   (LM-only, vLLM offline LLM; ~5-10x faster than `real`)
+demma:
+  # mode: vllm → load hulehule/DemMA-Planner-SFT through vLLM offline LLM.
+  # LM-only: parses [ACT] from generated text (no MLP classifier head).
+  # Requires `python scripts/download_demma.py` + `pip install vllm`.
+  # Use `real` for the official 2-pass classifier path; `mock` for CPU smoke.
+  mode: vllm
+  per_rollout_seed_offset: 1000  # zh_9 §3.3 — independent seeds per rollout
+
+  # ---- mode: real ---------------------------------------------------------
+  # Switch by setting `demma.mode: real` and (optionally) overriding paths.
+  # Defaults assume you ran:  python scripts/download_demma.py
+  real:
+    model_path: ./checkpoints/demma_planner_sft
+    classifier_path: ./checkpoints/demma_planner_sft/action_classifier.pt
+    long_memory_path: ./checkpoints/demma_planner_sft/memories_27_long.json
+    short_memory_path: ./checkpoints/demma_planner_sft/weekly_schedule.jsonl
+    patient_id: 0              # 0 = Jacob Johnson, AD-early (PI: persona 固定)
+    device: cuda               # "cuda" | "cuda:0" | "cpu" (cpu = debugging only)
+    dtype: bfloat16            # bf16 is faster than fp16 on H100/A100 and avoids overflow
+    temperature: 0.5           # matches inference_with_mem.py default
+    top_p: 0.9
+    max_new_tokens: 512        # official inference_with_mem.py uses 400; bumped to 512 for extra headroom (SFT targets are 75-150 tokens, so this is ~3-7x slack)
+    action_threshold: 0.35     # per-category top-1 sigmoid threshold (DemMA default; classifier mode only)
+    use_classifier: false      # false = parse [ACT] from generated text (1 forward, faster)
+                               # true  = official 2-pass: generate then read MLP head over hidden state
+
+  # ---- mode: vllm (offline LLM; LM-only, parses [ACT] from text) ---------
+  vllm:
+    model_path: ./checkpoints/demma_planner_sft
+    long_memory_path: ./checkpoints/demma_planner_sft/memories_27_long.json
+    short_memory_path: ./checkpoints/demma_planner_sft/weekly_schedule.jsonl
+    patient_id: 0              # 0 = Jacob Johnson, AD-early
+    dtype: bfloat16            # matches HF checkpoint native dtype
+    gpu_memory_utilization: 0.85   # lower (0.3-0.5) when sharing GPU with training
+    max_model_len: 2048        # prompt + max_new_tokens budget
+    tensor_parallel_size: 1    # raise to N for N-GPU sharding
+    enforce_eager: false       # false = use CUDA graphs (~10% faster)
+    temperature: 0.5
+    top_p: 0.9
+    max_new_tokens: 400        # matches official inference_with_mem.py; 256 truncates before [SPEAK] when [PLAN].reason is long
+
+# ---------------------------------------------------------------------------
+# Judge (mock for smoke run)
+# ---------------------------------------------------------------------------
+judge:
+  # mode: mock → src.rewards.mock_judge (CPU random; default for offline smoke)
+  # mode: vllm → src.rewards.vllm_judge_adapter.build_vllm_judges
+  #              (HTTP to OpenAI-compatible /v1/chat/completions; needs
+  #               `vllm serve <model> --port 8001` running on this or another box)
+  mode: mock
+  trajectory_judge_seed: 42
+  safety_judge_seed: 1042
+
+  # ---- mode: vllm ---------------------------------------------------------
+  # To run the real LLM judge, change `mode: vllm` above and (optionally)
+  # override the fields below. Start the server with e.g.:
+  #     vllm serve Qwen/Qwen3-32B-Instruct --port 8001
+  # (or use a smaller judge for smoke; Qwen3-8B works.)
+  vllm:
+    base_url: http://localhost:8001    # vLLM serve endpoint (no /v1 suffix)
+    model_name: Qwen/Qwen3-32B-Instruct
+    request_timeout_s: 120.0
+    max_tokens: 2048                   # rubrics produce ~500-1500 tokens of JSON
+    use_json_mode: true                # vLLM serve supports response_format=json_object
+    health_check_at_start: true        # ping endpoint at smoke start; fail fast if down
+    api_key: null                      # set if your vLLM serve has --api-key
+
+# ---------------------------------------------------------------------------
+# Rollout: standard GRPO group with unified prompt + temperature sampling
+# (Decision 1, see PROPOSAL §9)
+# ---------------------------------------------------------------------------
+# Group sampling protocol:
+#   for k = 1..group_size:
+#     τ_k ~ π_θ(·|s, caregiver.system_prompt)   [same prompt for every k]
+#                                               [diversity from temperature + seed]
+# The 10-strategy menu inside the system prompt is presented to the agent as
+# its action-space prior — the agent chooses / mixes / switches strategies
+# autonomously each turn (§4.2). Temperature ≥ 0.8 is required to keep group
+# trajectories meaningfully different for GRPO advantage estimation.
+rollout:
+  group_size: 5                # smoke compromise; zh_9 default = 10 (paper)
+  max_turns: 8                 # smoke compromise; zh_9 default = 10 (paper)
+  per_seed_offset: 7919        # used to derive a unique torch seed per (k, scenario)
+  parallel: true               # 5 trajectories rolled out in parallel via vLLM batch
+
+# ---------------------------------------------------------------------------
+# Reward / Safety (zh_9 §4.3–§4.6)
+# ---------------------------------------------------------------------------
+reward:
+  alpha: 1.0                   # α-weighted dual-horizon advantage (§4.6.2)
+                               # §6.3 A8 sweeps α ∈ {0.25, 0.5, 1, 2, 4}
+  lambda_safety_init: 16.0     # Decision 3: floor penalty.  Sized as 3 + 2·α_max + margin
+                               # so violator z-score < worst-clean across α∈[0.25, 4]
+                               # `λ_violation` for binary c_safety = 1.
+                               # FIXED constant (NOT Lagrangian dual-ascent).
+                               # Set large enough that violator advantage
+                               # = −5 < worst-clean ≈ −3 in the group.
+  per_turn_min_valid: 5        # zh_9 §4.6.1 percentile rank fallback threshold
+
+safety:
+  # Decision 3 (PROPOSAL §9): BINARY hard-veto safety. The 4 multi-turn
+  # regex pattern predicates of zh_9 §4.5 (P1–P4) are no longer used
+  # (the entire safety_predicates section in clinical_anchors.yaml was
+  # removed 2026-04-25). Catastrophic safety detection now lives entirely
+  # in prompts/rubrics/c_safety.yaml — 3 binary catastrophic items
+  # (medication confirmation / unsafe permission / coercion-with-escalation),
+  # OR-aggregated to c_safety ∈ {0, 1}, judged by the same trajectory-level
+  # LLM judge family that produces R_goal/R_fit/u_terminal (different model
+  # family from the caregiver, paper §6.4 anti-self-judging).
+  c_safety_aggregation: binary_any   # Decision 3 (was `max` under Decision 2)
+  hard_veto_threshold: 1             # c_safety = 1 → HARD VETO + λ_violation floor
+
+# ---------------------------------------------------------------------------
+# Data
+# ---------------------------------------------------------------------------
+data:
+  scenarios_path: data/scenarios_smoke.jsonl   # 100 scenarios, generated by
+                                                # scripts/build_smoke_scenarios.py
+  shuffle_seed: 0
+
+# ---------------------------------------------------------------------------
+# Validation gate (run this script at end-of-smoke to decide if pipeline OK)
+# ---------------------------------------------------------------------------
+validation_gate:
+  no_crash: true               # Phase E.3 hard requirement
+  no_nan_loss: true
+  kl_in_range: [0.005, 0.1]
+  c_cat_trigger_rate_max: 0.5  # >50% means rules too strict (back to C.3)
+  advantage_finite_fraction_min: 0.70  # ≥70% non-NaN advantage entries
+                                         # (variable trajectory length 5-8 turns × NaN
+                                         # padding to t_max ⇒ ~80% in expectation)

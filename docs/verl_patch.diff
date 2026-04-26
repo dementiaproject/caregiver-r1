@@ -1,0 +1,45 @@
+# Patch to apply inside your verl-GDPO fork.
+#
+# Apply with:
+#     cd /path/to/verl-GDPO
+#     git apply /path/to/caregiver-r1/docs/verl_patch.diff
+#
+# This adds the `ec_mtrl_dual_horizon` advantage estimator branch and
+# registers our custom rollout + reward manager in verl's worker registry.
+
+diff --git a/verl/trainer/ppo/ray_trainer.py b/verl/trainer/ppo/ray_trainer.py
+--- a/verl/trainer/ppo/ray_trainer.py
++++ b/verl/trainer/ppo/ray_trainer.py
+@@ -195,6 +195,12 @@ def compute_advantage(data, adv_estimator, gamma, lam, num_repeat=1):
+         data.batch['advantages'] = advantages
+         data.batch['returns'] = advantages
+
++    elif adv_estimator == 'ec_mtrl_dual_horizon':
++        # caregiver-r1 EC-MTRL: α-fused trajectory + turn advantage with
++        # binary hard-veto safety gate. See docs/verl_integration.md.
++        from caregiver_r1.training.verl_advantage_patch import compute_advantage_ec_mtrl
++        data = compute_advantage_ec_mtrl(data, cfg=...)  # FILL: thread `self.config.algorithm` here
++
+     else:
+         raise NotImplementedError
+     return data
+
+diff --git a/verl/workers/rollout/__init__.py b/verl/workers/rollout/__init__.py
+--- a/verl/workers/rollout/__init__.py
++++ b/verl/workers/rollout/__init__.py
+@@ -1,3 +1,7 @@
+ from .vllm_rollout import vLLMRollout
+ from .hf_rollout import HFRollout
++
++# caregiver-r1 — multi-turn caregiver↔DemMA rollout
++from caregiver_r1.training.verl_rollout_worker import CaregiverMultiTurnRollout
++ROLLOUT_REGISTRY = {'vllm': vLLMRollout, 'hf': HFRollout, 'caregiver_multi_turn': CaregiverMultiTurnRollout}
+
+diff --git a/verl/utils/reward_score/__init__.py b/verl/utils/reward_score/__init__.py
+--- a/verl/utils/reward_score/__init__.py
++++ b/verl/utils/reward_score/__init__.py
+@@ -1,2 +1,5 @@
+ from .gsm8k import compute_score as gsm8k_compute_score
++
++# caregiver-r1 — multi-turn reward manager
++from caregiver_r1.training.verl_reward_manager import CaregiverRewardManager

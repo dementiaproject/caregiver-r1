@@ -1,0 +1,128 @@
+# =============================================================================
+# Caregiver-R1 CPU smoke config.
+#
+# This is the lowest-friction entry point for README quickstart:
+#   - no caregiver model
+#   - no real DemMA checkpoint
+#   - no vLLM judge
+# It only checks schema plumbing, turn-level reward plumbing, and the
+# dual-horizon advantage estimator.
+# =============================================================================
+
+run:
+  name: smoke-cpu-mock
+  output_dir: ./runs/smoke_cpu
+  seed: 0
+  wandb_project: caregiver-r1-smoke
+  wandb_mode: disabled
+  log_every_step: 1
+
+trainer:
+  framework: smoke
+  algorithm: grpo
+  disable_value_head: true
+  disable_gae: true
+  total_epochs: 1
+  scenarios_per_epoch: 2
+  effective_batch_size: 2
+  gradient_accumulation_steps: 1
+  learning_rate: 1.0e-6
+  beta_kl_init: 0.01
+  beta_kl_target_range: [0.005, 0.1]
+  ppo_clip_eps: 0.2
+  max_grad_norm: 1.0
+
+caregiver:
+  mode: mock
+  http:
+    base_url: http://localhost:8000
+    model_name: Qwen/Qwen3-8B
+    temperature: 1.0
+    top_p: 0.9
+    max_tokens: 1024
+    request_timeout_s: 60.0
+    health_check_at_start: false
+    api_key: null
+  model_name_or_path: Qwen/Qwen3-8B-Instruct
+  use_thinking_mode: true
+  max_seq_len: 4096
+  system_prompt_path: prompts/caregiver_system_prompt.md
+  generation:
+    temperature: 0.9
+    top_p: 0.95
+    max_new_tokens: 512
+  kl_anchor_to: base
+  precision: bf16
+  use_flash_attention: false
+  vllm_inference:
+    tensor_parallel_size: 1
+    gpu_memory_utilization: 0.50
+
+demma:
+  mode: mock
+  per_rollout_seed_offset: 1000
+  real:
+    model_path: ./checkpoints/demma_planner_sft
+    classifier_path: ./checkpoints/demma_planner_sft/action_classifier.pt
+    long_memory_path: ./checkpoints/demma_planner_sft/memories_27_long.json
+    short_memory_path: ./checkpoints/demma_planner_sft/weekly_schedule.jsonl
+    patient_id: 0
+    device: cuda
+    dtype: bfloat16
+    temperature: 0.5
+    top_p: 0.9
+    max_new_tokens: 400
+    action_threshold: 0.35
+    use_classifier: false
+  vllm:
+    model_path: ./checkpoints/demma_planner_sft
+    long_memory_path: ./checkpoints/demma_planner_sft/memories_27_long.json
+    short_memory_path: ./checkpoints/demma_planner_sft/weekly_schedule.jsonl
+    patient_id: 0
+    dtype: bfloat16
+    gpu_memory_utilization: 0.40
+    max_model_len: 2048
+    tensor_parallel_size: 1
+    enforce_eager: false
+    temperature: 0.5
+    top_p: 0.9
+    max_new_tokens: 400
+
+judge:
+  mode: mock
+  trajectory_judge_seed: 42
+  safety_judge_seed: 1042
+  vllm:
+    base_url: http://localhost:8001
+    model_name: Qwen/Qwen3-8B
+    request_timeout_s: 120.0
+    max_tokens: 2048
+    use_json_mode: true
+    health_check_at_start: false
+    api_key: null
+
+rollout:
+  group_size: 5
+  max_turns: 4
+  per_seed_offset: 7919
+  parallel: false
+
+reward:
+  alpha: 1.0
+  lambda_safety_init: 16.0
+  per_turn_min_valid: 5
+
+safety:
+  c_safety_aggregation: binary_any
+  hard_veto_threshold: 1
+
+data:
+  scenarios_path: data/scenarios_smoke.jsonl
+  shuffle_seed: 0
+
+validation_gate:
+  no_crash: true
+  no_nan_loss: true
+  kl_in_range: [0.005, 0.1]
+  c_cat_trigger_rate_max: 0.5
+  advantage_finite_fraction_min: 0.70

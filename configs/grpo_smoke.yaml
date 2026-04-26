@@ -1,0 +1,118 @@
+# =============================================================================
+# GRPO smoke training config (scripts/train_grpo.py).
+#
+# This is the SCAFFOLD trainer's config — single-process, single-GPU. For
+# distributed multi-node training (verl-GDPO + Ray), see docs/verl_integration.md.
+# =============================================================================
+
+run:
+  name: grpo-day1
+  output_dir: ./runs/grpo_day1
+  seed: 0
+
+# Algorithm hyperparameters (zh_9 §4.6.2 EC-MTRL extension)
+algorithm:
+  adv_estimator: ec_mtrl_dual_horizon    # rather than verl built-ins (gae|grpo|gdpo)
+  alpha: 1.0                              # α in A_traj + α · A_turn
+  lambda_safety: 16.0                     # binary hard-veto floor penalty (Decision 3).
+                                          # 16 = 3 + 2·α_max + margin (covers α∈[0.25, 4])
+  min_valid_turn: 5
+  whiten_advantages: true                 # batch-wise mean/std after group-relative
+
+# Trainer (PPO-clip + KL anchor; critic-free)
+trainer:
+  framework: hf-baseline                  # hf-baseline = scripts/train_grpo.py
+                                          # verl       = phase-E port
+  algorithm: grpo
+  total_epochs: 1
+  scenarios_per_epoch: 100                # data/scenarios_smoke.jsonl size
+  effective_batch_size: 1                 # baseline = 1 group/step
+  gradient_accumulation_steps: 1          # already 1 group at a time
+
+  learning_rate: 1.0e-6
+  beta_kl_init: 0.01
+  beta_kl_target_range: [0.005, 0.1]
+  ppo_clip_eps: 0.2
+  max_grad_norm: 1.0
+  save_every: 5
+
+# Caregiver agent (HF transformers in baseline trainer)
+caregiver:
+  # ---- Rollout-time client backend (only used by SMOKE; train_grpo loads HF model directly)
+  mode: mock                              # placeholder | mock | http (smoke only)
+  http:
+    base_url: http://localhost:8000
+    model_name: Qwen/Qwen3-8B
+    temperature: 1.0
+    top_p: 0.9
+    max_tokens: 1024
+    request_timeout_s: 60.0
+    health_check_at_start: false
+
+  # ---- Policy / reference model loaded by train_grpo.py
+  model_name_or_path: Qwen/Qwen3-8B
+  precision: bf16
+  use_flash_attention: true
+  use_thinking_mode: false                # Qwen3 native thinking off; we use our own <think>+<response>
+  max_seq_len: 4096
+  generation:
+    temperature: 1.0
+    top_p: 0.9
+    max_new_tokens: 1024
+
+# DemMA simulator
+demma:
+  mode: mock                               # mock | real | vllm
+  per_rollout_seed_offset: 1000
+
+  real:
+    model_path: ./checkpoints/demma_planner_sft
+    classifier_path: ./checkpoints/demma_planner_sft/action_classifier.pt
+    long_memory_path: ./checkpoints/demma_planner_sft/memories_27_long.json
+    short_memory_path: ./checkpoints/demma_planner_sft/weekly_schedule.jsonl
+    patient_id: 0
+    device: cuda
+    dtype: bfloat16
+    temperature: 0.5
+    top_p: 0.9
+    max_new_tokens: 400
+    action_threshold: 0.35
+    use_classifier: false
+
+  vllm:
+    model_path: ./checkpoints/demma_planner_sft
+    long_memory_path: ./checkpoints/demma_planner_sft/memories_27_long.json
+    short_memory_path: ./checkpoints/demma_planner_sft/weekly_schedule.jsonl
+    patient_id: 0
+    dtype: bfloat16
+    gpu_memory_utilization: 0.40            # leave room for caregiver policy on same GPU
+    max_model_len: 2048
+    tensor_parallel_size: 1
+    enforce_eager: false
+    temperature: 0.5
+    top_p: 0.9
+    max_new_tokens: 400
+
+# Judge
+judge:
+  mode: mock                                # mock | vllm
+  trajectory_judge_seed: 42
+  safety_judge_seed: 1042
+  vllm:
+    base_url: http://localhost:8001
+    model_name: Qwen/Qwen3-8B
+    request_timeout_s: 120.0
+    max_tokens: 2048
+    use_json_mode: true
+    health_check_at_start: false
+    api_key: null
+
+# Rollout
+rollout:
+  group_size: 4                             # 4 trajectories/group for baseline
+  max_turns: 6
+  per_seed_offset: 7919
+
+# Data
+data:
+  scenarios_path: data/scenarios_smoke.jsonl

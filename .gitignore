@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Env / IDE
+.venv/
+venv/
+.env
+.idea/
+.vscode/
+
+# Project artefacts (gitignored — paths referenced from ENGINEERING_PLAN.md)
+data/raw/
+data/processed/
+checkpoints/
+eval_reports/
+wandb/
+outputs/
+.hydra/
+*.lock.local.yaml
+
+# Tooling caches
+.mypy_cache/
+.cache/
+
+# Cursor chat archive (8.9 MB; backup of pre-migration agent transcripts)
+.chat_archive/
+
+# Local run outputs
+runs/

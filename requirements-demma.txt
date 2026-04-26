@@ -1,0 +1,35 @@
+# =============================================================================
+# Caregiver-R1 — DemMA real-client deployment dependencies
+# =============================================================================
+# Use this on the GPU box where you'll run scripts/run_smoke.py with
+# demma.mode=real (i.e. the transformers in-process DemMA wrapper).
+#
+# CPU-only dev boxes do not need any of these — DemMA imports lazily; the
+# mock client (default mode) only needs pydantic + omegaconf + numpy.
+#
+# Install:
+#     cd caregiver-r1
+#     pip install -r requirements-demma.txt
+#
+# Verified-good versions as of 2026-04. Pin majors but keep minors flexible
+# so security patches can land without re-validation.
+# =============================================================================
+
+# --- Core data layer (also needed by mock client) -----------------------------
+pydantic>=2.5,<3.0
+omegaconf>=2.3,<3.0
+numpy>=1.26,<3.0
+
+# --- DemMA inference (transformers in-process) --------------------------------
+torch>=2.4,<3.0                # CUDA build expected on the GPU box
+transformers>=4.45,<5.0        # Qwen3 architecture support (≥4.45)
+huggingface_hub>=0.25,<1.0     # snapshot_download for scripts/download_demma.py
+accelerate>=0.34,<2.0          # device_map="cuda"; required by AutoModelForCausalLM
+safetensors>=0.4,<1.0          # checkpoint shard loading
+sentencepiece>=0.2             # tokenizer fallback for some Qwen variants
+
+# --- Optional: faster attention; comment out if your GPU lacks SM80+ ---------
+# flash-attn>=2.6,<3.0          # uncomment if running on A100/H100/L40S
+
+# --- Tests (only needed for CI / dev) ----------------------------------------
+pytest>=8.0,<9.0

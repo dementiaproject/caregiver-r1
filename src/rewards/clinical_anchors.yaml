@@ -1,0 +1,155 @@
+# =============================================================================
+# Clinical anchors for turn-level reward channel (zh_9 §4.3, appendix B.3)
+# =============================================================================
+# Maps the 34-label DemMA inline-annotation alphabet to:
+#   - distress weight buckets (severe / moderate / positive / excluded)
+#   - resistance tier buckets (physical_refusal / verbal_refusal / hesitation /
+#     accepting)
+#   - care-bid keyword + regex patterns
+#
+# Each label is anchored in ONE of the three clinical scales paper §4.3 cites:
+#   - PAINAD  — Pain Assessment in Advanced Dementia (Warden 2003), 5 items × 0/1/2
+#   - OERS    — Observed Emotion Rating Scale (Lawton 1996), 6 dimensions × intensity
+#   - RTC     — Resistiveness to Care (Mahoney 1999, revised Jablonski 2018, κ ∈ [0.87, 1.0])
+#
+# Each scale is used only in its native validated domain (PAINAD/OERS for
+# emotional distress observation; RTC for caregiver-attempt resistance).
+# Anchors are noted as inline comments next to each label so a clinical
+# reviewer can audit them line-by-line without reading Python.
+#
+# A label may appear in BOTH distress and resistance buckets (e.g. "pushing
+# caregiver away" is severe-distress AND physical-refusal) — they are
+# orthogonal observation constructs (emotional valence vs care-attempt
+# acceptance) per zh_9 §4.3.
+#
+# This file is read by src.rewards.turn_level via PyYAML once at import
+# (LRU-cached). The SHA-256 hash of this file is committed to the run lock
+# (zh_9 §4.3 — "rule table hash written to lock file").
+# =============================================================================
+
+distress:
+  severe:                                # multi-label sum weight = +3 each (zh_9 §4.3)
+    - "crying"                           # PAINAD vocalization=2
+    - "groaning in pain"                 # PAINAD vocalization=2
+    - "pushing caregiver away"           # PAINAD body language=2 (defensive)
+    - "throwing objects"                 # OERS anger=high
+    - "slapping table"                   # OERS anger=high
+    - "covering ears"                    # OERS distress=severe (sensory escape)
+
+  moderate:                              # multi-label sum weight = +1 each
+    - "frowning"                         # PAINAD facial=1 / OERS sadness=mid (zh_9 §4.3 example)
+    - "sighing"                          # PAINAD vocalization=1 / OERS sadness=mid (zh_9 §4.3 example)
+    - "lowering head"                    # OERS sadness=mid (withdrawal) (zh_9 §4.3 example)
+    - "avoiding eye contact"             # OERS sadness=mid (withdrawal) (zh_9 §4.3 example)
+    - "clenching fist"                   # PAINAD body language=1
+    - "gripping armrest tightly"         # OERS anxiety=mid
+    - "pacing back and forth"            # OERS anxiety=mid (agitation)
+    - "fidgeting"                        # OERS anxiety=mid (restlessness)
+    - "rubbing fingers"                  # OERS anxiety=mid (self-soothe)
+    - "fiddling with clothing"           # OERS anxiety=mid (self-soothe)
+    - "touching forehead"                # OERS distress=mid (somatic)
+
+  positive:                              # multi-label sum weight = -1 each
+    - "smiling"                          # PAINAD pleasure / OERS pleasure=mid
+    - "laughing"                         # OERS pleasure=high
+    - "nodding"                          # OERS engagement positive
+    - "holding caregiver's hand"         # OERS connection positive
+
+  excluded_from_distress:                # weight = 0; NOT a distress signal
+    # ── Dementia baseline (Bug 1 fix) ──────────────────────────────────────
+    # Characteristic of dementia neuropathology itself, not caregiver-induced
+    # distress. Including these would inflate D_t baseline and pollute the
+    # PBRS shaping signal across most turns.
+    - "vacant expression"                # dementia trait (cognitive disengagement)
+    - "staring blankly"                  # dementia trait (cognitive disengagement)
+    - "repetitive words"                 # dementia perseveration
+    - "murmuring / self-talk"            # dementia perseveration
+    - "looking around"                   # dementia disorientation
+    # ── Genuinely ambiguous / context-dependent ────────────────────────────
+    - "standing up"                      # neutral motion (could be agitation or normal)
+    - "shaking hands"                    # tremor — ambiguous (PD vs anxiety vs neutral)
+    - "very surprised (wow)"             # neutral surprise; not distress per se
+    # ── Used in resistance channel only, not distress ──────────────────────
+    - "stepping back"
+    - "freezing mid-step"
+    - "shaking head"
+    - "verbal hesitation (um / uh)"
+    - "silence for several seconds"
+
+# Patient-text reinforcement (zh_9 §4.3): presence of any of these keywords
+# in the patient utterance adds +1 to the distress sum (lifts a single
+# moderate cue from D=1 to D=2).
+distress_text_keywords:
+  - "leave me alone"
+  - "go away"
+  - "stop"
+  - "i don't want"
+  - "i hate"
+
+resistance:
+  physical_refusal:                      # R = 3
+    - "pushing caregiver away"           # RTC item: pushes
+    - "throwing objects"                 # RTC item: throws
+    - "slapping table"                   # RTC item: hits/slaps
+    # Bug 2 fix: "covering ears" removed — sensory escape ≠ care-directed refusal
+    # under RTC; it is severe distress but not a refusal toward caregiver.
+
+  verbal_refusal:                        # R = 2 (annotation cue)
+    - "shaking head"                     # RTC item: pulls/turns head away
+
+  hesitation:                            # R = 1
+    - "stepping back"                    # RTC item: pulls away
+    - "freezing mid-step"                # RTC item: hesitation
+    - "verbal hesitation (um / uh)"      # RTC item: verbal hesitation
+    - "silence for several seconds"      # RTC item: passive non-engagement
+
+  accepting:                             # R = 0 (cooperative)
+    - "nodding"
+    - "holding caregiver's hand"
+
+# Verbal-text patterns: presence of these keywords in the patient utterance
+# promotes R from 1 (hesitation) to 2 (verbal_refusal), per zh_9 §4.3.
+verbal_refusal_text_keywords:
+  - "no"
+  - "i won't"
+  - "don't"
+  - "i refuse"
+
+# Care-bid mask b_t (zh_9 §4.3): True iff caregiver_response on this turn
+# carries an explicit care attempt (medication / fact correction / redirection).
+# RTC measurement convention only counts resistance during care attempts.
+# Conservative keyword + regex stub for v1; appendix C.2 audit may upgrade.
+care_bid:
+  keywords:                              # case-insensitive substring match
+    - "medication"
+    - "pill"
+    - "your meds"
+    - "morning pill"
+    - "take this"
+    - "take your"
+    - "let's go"
+    - "shall we"
+    - "would you like to"
+    - "come with me"
+    - "let me help"
+    - "your tea"
+  patterns:                              # case-insensitive regex (Python re.IGNORECASE)
+    # Imperative + action verb: "please take", "let's go", "would you sit"
+    - "(?i)\\b(please|let's|shall we|would you|could you)\\s+(take|go|come|sit|stand|eat|drink|try|have)"
+    # Reality-orientation factual correction phrases
+    - "(?i)\\b(actually|in fact|the truth is|today is|it's\\s+\\d{4})"
+    # Direct factual contradiction of patient's identity claim
+    - "(?i)\\byour\\s+(mother|father|husband|wife|son|daughter)\\s+(passed|died|is no longer)"
+
+# =============================================================================
+# Safety predicate patterns — REMOVED 2026-04-25
+# =============================================================================
+# Decision 2 (2026-04-25, see PROPOSAL §9): the two-layer safety design (regex
+# C_cat hard veto + LLM c_safety Lagrangian) was collapsed into a single
+# trajectory-level LLM safety judge producing c_safety ∈ {0,1,2,3}. The
+# top tier (c_safety=3) triggers hard veto; tiers {1,2} feed the Lagrangian.
+#
+# Consequently the regex predicate banks (stance_affirm / permit / coercive /
+# hard_correct) and the per-conflict risky-request keyword list previously
+# in this file are no longer used. They have been removed; safety logic now
+# lives entirely in `src/rewards/safety_judge.py` (Phase F deliverable).

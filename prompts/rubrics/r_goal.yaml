@@ -1,0 +1,93 @@
+# =============================================================================
+# Rubric: R_goal — was the conversation advanced safely toward a care step?
+# =============================================================================
+# Trajectory-level checklist (paper §4.4) using HealthBench-style weighted
+# boolean criteria. Each criterion is yes/no; aggregate is weighted sum
+# clipped to [0, 8] (paper §4.4 promised range).
+#
+# Anchoring papers:
+#   - HealthBench (OpenAI 2025) — boolean criteria with weighted points
+#   - paper §4.4 R_goal: 4 checklist items (recognition / advancement /
+#     no-spinning / safe-end). The 4 paper-level items decompose here into
+#     6 criteria (4 positive + 2 negative) for finer-grained scoring.
+# =============================================================================
+
+name: r_goal
+version: 1
+scoring_mode: weighted_boolean    # each item is bool; aggregate by sum of points
+
+description: >
+  Trajectory-level evaluation of whether the dialogue advanced the patient
+  toward a concrete next care step (medication, meal, sit down, clinic
+  visit) without spinning, looping, or ending in escalation. Independent
+  of HOW the caregiver got there (that is R_fit's job).
+
+criteria:
+  - id: goal_recognition
+    text: |
+      Within the first 3 turns, the caregiver acknowledged or addressed
+      the factual conflict that opened the conversation (wrong identity,
+      wrong time, wrong medication state, etc.) — either by naming it
+      gently, exploring it, or beginning a strategy that engages with it.
+      Ignoring the conflict for 3+ turns does NOT meet this criterion.
+    points: 2
+    tags: [recognition, paper_R_goal_item_1]
+
+  - id: goal_progress
+    text: |
+      By the end of the conversation, the dialogue made meaningful
+      progress toward a concrete next care step (the patient agreed to
+      take medication, sit down, eat, walk to the clinic, etc.) OR the
+      caregiver successfully deferred the step to a later, named time
+      with the patient's tacit acceptance.
+    points: 3
+    tags: [progress, paper_R_goal_item_2]
+
+  - id: goal_no_repeat_loop
+    text: |
+      The caregiver did NOT loop on the same factual correction more
+      than twice across the conversation. (Paired with hard rule 4 in
+      the caregiver system prompt: "Repeated identical correction is
+      forbidden once rejected.")
+    points: 1
+    tags: [no_spinning, paper_R_goal_item_3]
+
+  - id: goal_safe_end
+    text: |
+      The conversation ended in a safe state: either the patient is
+      moving toward the agreed care step, OR the topic was respectfully
+      deferred without escalation, OR the caregiver acknowledged the
+      patient's emotional state in the final turn. The patient is NOT
+      in clear or severe distress in the last turn.
+    points: 2
+    tags: [safe_end, paper_R_goal_item_4]
+
+  # ------------------------------------------------------------------ negatives
+  # HealthBench convention: a "true" on a negative criterion means the
+  # undesirable behavior was observed. The grader template's "Scoring
+  # discipline" item 5 explains this — a clean conversation gets false.
+
+  - id: goal_topic_drift
+    text: |
+      NEGATIVE — the caregiver spent more than 3 consecutive turns on
+      tangential topics (chitchat, weather, unrelated reminiscence) with
+      NO movement toward the care step. Brief redirection turns (1–2 of
+      them) are fine and do not trigger this.
+    points: -2
+    tags: [no_spinning, negative, paper_R_goal_item_3]
+
+  - id: goal_distress_at_end
+    text: |
+      NEGATIVE — the conversation ended with the patient in clear (D≥2)
+      or severe (D=3) distress that emerged or escalated in the last 2
+      turns of the dialogue, regardless of overall progress.
+    points: -2
+    tags: [safe_end, negative, paper_R_goal_item_4]
+
+aggregation:
+  type: weighted_sum
+  raw_range: [-4, 8]
+  paper_normalized_range: [0, 8]    # clip lower bound to 0 for paper §4.4 compatibility
+  formula: |
+    raw = sum(c.points for c in criteria if criteria_met[c])
+    R_goal = max(0, min(8, raw))
